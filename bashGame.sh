@@ -1,0 +1,434 @@
+#!/usr/bin/env -S bash --restricted --noprofile
+#
+# @file bashgame
+# @description Remake/Tribute to the original from gist.github.com/SomeCrazyGuy
+# @author gmt4 <gmt4 at github.com> (c) Copyright 2024
+# @url github.com/gmt4/bashgame
+#
+# Original https://gist.github.com/SomeCrazyGuy/4c844da3c181912579c0e324f17f39a6#file-bash_game
+#
+# A plataformer in bash: "Collect all the coins, and reach the other side!!"
+# This version adds color, and game banners ASCII art
+#
+
+PROGNAME=${0##*/}
+PROGVERSION=v1.0
+PROGAUTHOR=gmt4
+PROGURL="https://github.com/gmt4/bashgame"
+
+#extra strict flags
+set -euo pipefail
+
+#screen buffer
+declare -a level
+
+#globals
+declare -i lv_w=0 #width of level
+declare -i lv_h=0 #height of level
+declare -i status_line=0
+declare -i lives=0 #lives
+declare -i coins=0 #coins
+declare -i ammo=0  #ammo
+nextTile=''
+
+#constants, added after the fact to improve tweaking the numbers
+kFPSdelay='0.03'  #DEFAULT: 0.03, 33 FPS - good setting
+kPlayerBlock='@'  #DEFAULT: '@" - the player
+kBarrierBlock='#' #DEFAULT: '#' - the block you can stand on
+kEmptyBlock=' '   #DEFAULT: ' ' - air
+kAmmoBlock='*'    #DEFAULT: '*' - ammunition used to break blocks/walls, fired with [asdf]
+kCoinBlock='$'    #DEFAULT: '$' - it's not a platformer unless you can increment a variable
+kSpikeBlock='^'   #DEFAULT: '^' - instant death when touching this
+kWinBlock='%'     #DEFAULT: '%' - instant win when touching this
+kUpVelocity=-25   #DEFAULT: -25 - could be too high
+kDownVelocity=5   #DEFAULT: -5
+kLeftVelocity=-5  #DEFAULT: -5
+kRightVelocity=5  #DEFAULT: 5
+kGravityFPSMod=5  #DEFAULT: 5 - provides a delay when falling
+kVelocityMod=5    #DEFAULT: 5
+
+#Art is hard
+
+you_won_legend="Goodspeed Adventurer $USER, you won the game!!"
+you_won='
+##################################################
+# __  __               _       __            __
+# \ \/ /___  __  __   | |     / /___  ____  / /
+#  \  / __ \/ / / /   | | /| / / __ \/ __ \/ /
+#  / / /_/ / /_/ /    | |/ |/ / /_/ / / / /_/
+# /_/\____/\__,_/     |__/|__/\____/_/ /_(_)
+#
+##################################################
+'
+
+get_ready_legend="Welcome Adventurer $USER, Collect all the coins, and reach the other side!!"
+get_ready='
+##################################################
+#    ______     __     ____                 __      __
+#   / ____/__  / /_   / __ \___  ____ _____/ /_  __/ /
+#  / / __/ _ \/ __/  / /_/ / _ \/ __ `/ __  / / / / /
+# / /_/ /  __/ /_   / _, _/  __/ /_/ / /_/ / /_/ /_/
+# \____/\___/\__/  /_/ |_|\___/\__,_/\__,_/\__, (_)
+#                                         /____/
+#
+##################################################
+'
+
+#less ambitious art this time
+game_over_legend="$USER fell into the pit, landed on a spike, and became less of an adventurer."
+game_over='
+##################################################
+#    ______                        ____
+#   / ____/___ _____ ___  ___     / __ \_   _____  _____
+#  / / __/ __ `/ __ `__ \/ _ \   / / / / | / / _ \/ ___/
+# / /_/ / /_/ / / / / / /  __/  / /_/ /| |/ /  __/ /
+# \____/\__,_/_/ /_/ /_/\___/   \____/ |___/\___/_/
+#
+##################################################
+'
+
+warn() { printf "$@" >&2; }
+die()  { e=$1; shift; warn "$@"; exit "$e"; }
+
+#move the cursor to a specific row and colunm
+put_cursor() {
+	echo -en "\e[${1};${2}f"
+}
+
+init_screen() {
+	local height
+	#get the size of the terminal
+	put_cursor 999 999
+	echo -en '\e[6n'
+	read -s -r -d'['
+	read -s -r -d';' height
+	read -s -r -d'R' lv_w
+
+	lv_h=$((height-1))
+	status_line=height
+}
+
+#usage: mvprintw $row $col $string
+mvprintw() {
+	local row=$(($1+1)) #rows count at 1 in escape sequences, I guess
+	local col=$2
+	printf "%s%s%s" $'\x1b[' "${row};${col}f" "$3"
+}
+
+#usage: draw_row $row_number
+draw_row() {
+	mvprintw "$1" 0 "${level[$1]}"
+}
+
+#use really fancy procedural generation
+gen_level() {
+	local rowstr=''
+	local foo=0
+
+	for (( y=0; y<lv_h; ++y ))
+	do
+		for (( x=0; x<lv_w; ++x ))
+		do
+			foo=$((RANDOM % 6))
+			case "$foo" in
+				( 0 ) rowstr+="$kBarrierBlock" ;;
+				( 1 ) rowstr+="$kBarrierBlock" ;;
+				( 2 ) rowstr+="$kEmptyBlock" ;;
+				( 3 ) rowstr+="$kEmptyBlock" ;;
+				( 4 ) rowstr+="$kCoinBlock"; coins=$((coins+1)) ;;
+				( 5 ) rowstr+="$kCoinBlock"; coins=$((coins+1)) ;;
+			esac
+		done
+
+		level[$y]="$rowstr"
+		rowstr=''
+	done
+	for (( x=0; x<lv_w; ++x ))
+	do
+		rowstr+="$kSpikeBlock"
+	done
+	level[(( lv_h - 1 ))]="$rowstr"
+}
+
+load_level() {
+	local y=0
+	local rowstr=''
+	while read -r rowstr
+	do
+		level[$y]="$rowstr"
+		y=$((y+1))
+		if [ $y -eq $lv_h  ]; then break; fi
+	done
+
+    if [ $y -lt $lv_h ]
+    then
+        die 0 "\r$PROGNAME: error level only defines $y rows while term height is $lv_h rows\n"
+    fi
+
+}
+
+#usage: twidle $row $col $replace_char
+twidle() {
+	local row="$1"
+	local col="$2"
+	local chr="$3"
+	local lvrest="${level[$row]:$col}"
+	local lvfirst=''
+	col=$((col-1))
+	(( col > 0 )) && lvfirst="${level[$row]:0:$col}"
+	level[$row]="${lvfirst}${chr}${lvrest}"
+}
+
+#usage: draw_player $row $col
+draw_player() {
+	#Display Attrs       #Fg Colours   #Bg Colours
+	#0 Reset all attrs   #30 Black     #40 Black
+	#1 Bright            #31 Red       #41 Red
+	#2 Dim               #32 Green     #42 Green
+	#4 Underscore	     #33 Yellow    #43 Yellow
+	#5 Blink             #34 Blue      #44 Blue
+	#6                   #35 Magenta   #45 Magenta
+	#7 Reverse           #36 Cyan      #46 Cyan
+	#8 Hidden            #37 White     #47 White
+	mvprintw "$1" "$2" $'\x1b[01;32m'$kPlayerBlock$'\x1b[0m'
+}
+
+draw_level() {
+	for (( y=0; y<lv_h; ++y ))
+	do
+        draw_row "$y"
+	done
+}
+
+draw_color() {
+    if [ -n "${NO_COLOR:-}" ];
+    then
+        sed '';
+    else
+        sed \
+            -e "s/$kWinBlock/\x1b[00;34m$kWinBlock\x1b[0m/g;" \
+            -e "s/\\$kCoinBlock/\x1b[00;33m$kCoinBlock\x1b[0m/g;" \
+			-e "s/\\$kAmmoBlock/\x1b[00;31m$kAmmoBlock\x1b[0m/g;" \
+            -e "s/\\$kSpikeBlock/\x1b[00;35m$kSpikeBlock\x1b[0m/g;" \
+            -e "s/$kBarrierBlock/\x1b[00;36m$kBarrierBlock\x1b[0m/g;"
+    fi
+}
+
+#usage: checktile $row $col
+checktile() {
+	local row=$1
+	local col=$(($2-1))
+
+	if (( row < 0 )) || (( col < 0 ))
+	then
+		nextTile="$kBarrierBlock"
+		return
+	elif (( row == lv_h ))
+	then
+		nextTile="$kSpikeBlock"
+		return
+	elif (( col == lv_w ))
+	then
+		nextTile="$kWinBlock"
+		return
+	else
+		nextTile="${level[$row]:$col:1}"
+		return
+	fi
+
+	return
+}
+
+game() {
+	local px=1 #player X coordinate
+	local py=0 #player Y coordinate
+	local pxv=0 #player X velocity
+	local pyv=0 #player Y velocity
+	local pog=0 #player is on ground
+	local npx=0 #new player X, needs to be checked
+	local npy=0 #new player Y, needs to be checked
+	local score=0 #player score
+	local fps_mod=0 #to delay animations
+
+	#disable line wrap, clear screen, disable text cursor
+	echo -en '\e[7l\e[2J\e[?25l'
+
+	echo -e "$get_ready_legend"
+	read
+	echo -e "$get_ready"
+	read
+
+	init_screen
+
+    if [ $# -eq 0 ]
+    then
+        gen_level
+    else
+        load_level < "$1"
+    fi
+
+	#make spawnpoint safe
+	for (( y=0; y<3; ++y ))
+	do
+        twidle 0 "$y" '*'
+        twidle 1 "$y" '*'
+	done
+
+	draw_level | draw_color
+
+	#main loop
+	while true
+	do
+		#read input
+		if read -r -s -N1 -t "$kFPSdelay" #framerate control
+		then case "$REPLY" in
+			( $'\x1b' )
+				if read -r -s -N1 -t '0.1'
+				then case "$REPLY" in
+					( '[' )
+						if read -r -s -N1 -t '0.1'
+						then case "$REPLY" in
+							( 'A' )	(( pog == 1 )) && pyv=$kUpVelocity ;; #up
+							( 'B' ) pyv=$kDownVelocity ;; #down
+							( 'C' ) pxv=$kRightVelocity ;; #right
+							( 'D' ) pxv=$kLeftVelocity ;; #left
+							esac
+						fi
+						;;
+					esac
+				fi
+				;;
+			( ' ' ) # teleport
+				px=$(( px + RANDOM % (lv_w-px) ))
+				py=$(( RANDOM % (py+1) ))
+				;;
+
+			( a ) # ammo left
+				twidle $py $((px-1)) '&'
+				ammo=$((ammo-1))
+				;;
+			( s ) # ammo down
+				twidle $((py+1)) $px '&'
+				ammo=$((ammo-1))
+				;;
+			( d ) # ammo right
+				twidle $py $((px+1)) '&'
+				ammo=$((ammo-1))
+				;;
+			( w ) # ammo up
+				twidle $((py-1)) $px '&'
+				ammo=$((ammo-1))
+				;;
+
+			( q|Q ) # quit
+                break ;;
+			( h|H ) # help
+                break ;;
+			esac
+		fi
+
+		##advance animation
+		checktile $((py+1)) $px
+		[[ "$nextTile" == "$kBarrierBlock" ]] && pog=1 || pog=0
+
+		(( pog == 0 )) && (( (++fps_mod) == kGravityFPSMod )) && pyv=$((pyv+1)) && fps_mod=0
+
+		if (( pxv > 0 ))
+		then
+			pxv=$((pxv-1))
+			if (( (pxv % kVelocityMod) == 0 ))
+			then npx=$((px+1))
+			fi
+		fi
+
+		if (( pxv < 0 ))
+		then
+			pxv=$((pxv+1))
+			if (( (pxv % kVelocityMod) == 0 ))
+			then npx=$((px-1))
+			fi
+		fi
+
+		if (( pyv > 0 ))
+		then
+			pyv=$((pyv-1))
+			if (( (pyv % kVelocityMod) == 0 ))
+			then npy=$((py+1))
+			fi
+		fi
+
+		if (( pyv < 0 ))
+		then
+			pyv=$((pyv+1))
+			if (( (pyv % kVelocityMod) == 0 ))
+			then npy=$((py-1))
+			fi
+		fi
+
+		#tile based collision detection
+		checktile $npy $npx
+		case "$nextTile" in
+			( "$kBarrierBlock" )
+				npx=$px
+				npy=$py
+				;;
+			( "$kCoinBlock" )
+				twidle $npy $npx ' '
+				score=$((score+1))
+				;;
+			( "$kAmmoBlock" )
+				twidle $npy $npx ' '
+				ammo=$((ammo+1))
+				;;
+			( "$kSpikeBlock" ) #lose
+				mvprintw 0 0 $'\x1b[2J'
+				echo -e "$game_over"
+				echo -e "$game_over_legend"
+				echo "Final Score: $score"
+				break
+				;;
+			( "$kWinBlock" ) #win
+				mvprintw 0 0 $'\x1b[2J'
+				echo -e "$you_won"
+				echo -e "$you_won_legend"
+				echo "Final Score: $score"
+				break
+				;;
+		esac
+
+		#render player
+		if (( npx != px )) || (( npy != py ))
+		then
+			mvprintw $py $px ' '
+			draw_player $npy $npx
+			px=$npx
+			py=$npy
+		fi
+
+        game_status="xyg:$px,$py,$pog "$'\x1b[00;32m@\x1b[0m'":$lives "$'\x1b[00;33m$\x1b[0m'":$score "$'\x1b[00;31m*\x1b[0m'":$ammo vxy:$pxv,$pyv"
+
+		#status line
+		mvprintw "$status_line" 0 $'\x1b[2K'
+        mvprintw "$status_line" 0 "$PROGAUTHOR/$PROGNAME $PROGVERSION $game_status"
+	done
+
+	# enable text cursor
+	echo -en '\e[?25h'
+}
+
+usage()
+{
+    echo "usage: $PROGNAME opts # @version $PROGVERSION (c) $PROGAUTHOR $PROGURL"
+    exit
+}
+
+main()
+{
+    case "${1:-}" in
+    -h|*help|*usage) usage ;;
+    -v|*version)     usage ;;
+    *)               game "$@" ;;
+    esac
+}
+
+main "$@"
